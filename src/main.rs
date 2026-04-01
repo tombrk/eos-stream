@@ -1,59 +1,336 @@
-use std::{io, sync::Arc, sync::Mutex, thread};
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
+
+mod bindings {
+    include!(concat!(env!("OUT_DIR"), "/uvc_bindings.rs"));
+}
+
+use std::{io::Write, ptr, sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering}, sync::Mutex, thread};
 
 use anyhow::{Context, Result};
-use clap::{command, Parser};
-use console::{self, Term};
-use gphoto2::{widget::RadioWidget, Context as CameraContext};
-use std::io::Write;
+use clap::Parser;
+use gphoto2::Context as CameraContext;
+use usb_gadget::{
+    default_udc,
+    function::video::Format,
+    Class, Config, Gadget, Id, Strings,
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
-/// JPEG preview stream from Canon EOS cameras.
-///
-/// Use +/- keys to adjust focus
-struct Args {}
+/// Stream Canon EOS camera as a USB webcam via UVC gadget.
+struct Args {
+    /// Drop into focus control TUI (signals running daemon)
+    #[arg(long)]
+    focus: bool,
+}
 
-fn main() -> Result<()> {
-    let _ = Args::parse();
-    let mut out = io::stdout();
+const PID_FILE: &str = "/run/eos-stream.pid";
 
-    let ctx = CameraContext::new()?;
-    let camera = ctx
-        .autodetect_camera()
-        .wait()
-        .with_context(|| "Failed to discover a camera")?;
+static PREVIEW_WIDTH: AtomicU32 = AtomicU32::new(1280);
+static PREVIEW_HEIGHT: AtomicU32 = AtomicU32::new(720);
+const FPS: u16 = 30;
 
-    let focus = camera
-        .config_key::<RadioWidget>("manualfocusdrive")
-        .wait()?;
+static FRAME_NUM: AtomicU32 = AtomicU32::new(0);
 
-    let camera = Arc::new(Mutex::new(camera));
+struct CameraState {
+    ctx: CameraContext,
+    camera: gphoto2::Camera,
+}
 
-    let cam = camera.clone();
-    thread::spawn(move || -> Result<()> {
-        let term = Term::stderr();
-        loop {
-            let res = match term.read_char()? {
-                '+' => {
-                    focus.set_choice("Near 1")?;
-                    cam.lock().unwrap().set_config(&focus).wait()
-                }
-                '-' => {
-                    focus.set_choice("Far 1")?;
-                    cam.lock().unwrap().set_config(&focus).wait()
-                }
-                _ => Ok(()),
-            };
-            if let Err(err) = res {
-                eprintln!("set focus: {}", err)
+static CAMERA: Mutex<Option<CameraState>> = Mutex::new(None);
+
+static FOCUS_NEAR: AtomicI32 = AtomicI32::new(0);
+static FOCUS_FAR: AtomicI32 = AtomicI32::new(0);
+
+fn handle_focus_signal(sig: libc::c_int) {
+    if sig == libc::SIGUSR1 {
+        FOCUS_NEAR.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FOCUS_FAR.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn focus_client() -> Result<()> {
+    let pid = std::fs::read_to_string(PID_FILE)
+        .with_context(|| format!("No daemon running (can't read {PID_FILE})"))?
+        .trim().parse::<i32>()
+        .with_context(|| "Invalid pid file")?;
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        anyhow::bail!("Daemon pid {pid} not running");
+    }
+    let term = console::Term::stderr();
+    eprintln!("Focus control (daemon pid {pid})");
+    eprintln!("  +  focus nearer");
+    eprintln!("  -  focus farther");
+    eprintln!("  ^C quit");
+    loop {
+        match term.read_char()? {
+            '+' => {
+                unsafe { libc::kill(pid, libc::SIGUSR1); }
+                eprint!(".");
+                std::io::stderr().flush()?;
+            }
+            '-' => {
+                unsafe { libc::kill(pid, libc::SIGUSR2); }
+                eprint!(".");
+                std::io::stderr().flush()?;
+            }
+            '\x03' => break,
+            _ => {}
+        }
+    }
+    eprintln!();
+    Ok(())
+}
+
+/// Called from C when the host starts streaming.
+#[no_mangle]
+pub extern "C" fn rust_camera_start() -> i32 {
+    let ctx = match CameraContext::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("gphoto2 context failed: {}", e);
+            return -1;
+        }
+    };
+    let camera = match ctx.autodetect_camera().wait() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Camera not found: {}", e);
+            return -1;
+        }
+    };
+    eprintln!("Camera connected: {}", camera.abilities().model());
+    FRAME_NUM.store(0, Ordering::Relaxed);
+    *CAMERA.lock().unwrap() = Some(CameraState { ctx, camera });
+    0
+}
+
+/// Called from C when the host stops streaming.
+#[no_mangle]
+pub extern "C" fn rust_camera_stop() {
+    let prev = CAMERA.lock().unwrap().take();
+    if prev.is_some() {
+        eprintln!("Camera disconnected");
+    }
+}
+
+/// Called from C (rust-source.c) to fill a buffer with MJPEG data.
+#[no_mangle]
+pub extern "C" fn rust_fill_jpeg(buf: *mut u8, max_size: u32) -> u32 {
+    let n = FRAME_NUM.fetch_add(1, Ordering::Relaxed);
+    let guard = CAMERA.lock().unwrap();
+    let Some(state) = guard.as_ref() else { return 0 };
+
+    let near = FOCUS_NEAR.swap(0, Ordering::Relaxed);
+    let far = FOCUS_FAR.swap(0, Ordering::Relaxed);
+    for (count, choice) in [(near, "Near 1"), (far, "Far 1")] {
+        for _ in 0..count {
+            if let Ok(focus) = state.camera.config_key::<gphoto2::widget::RadioWidget>("manualfocusdrive").wait() {
+                let _ = focus.set_choice(choice);
+                let _ = state.camera.set_config(&focus).wait();
             }
         }
-    });
-
-    let cam = camera.clone();
-    loop {
-        let frame = cam.lock().unwrap().capture_preview().wait()?;
-        let data = frame.get_data(&ctx).wait()?;
-        out.write_all(&data)?;
     }
+
+    let frame = match state.camera.capture_preview().wait() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("capture_preview failed: {}", e);
+            return 0;
+        }
+    };
+    let data = match frame.get_data(&state.ctx).wait() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("get_data failed: {}", e);
+            return 0;
+        }
+    };
+    drop(guard);
+
+    let len = data.len().min(max_size as usize);
+
+    if n == 0 {
+        let _ = std::fs::write("/tmp/test_frame.jpg", &data);
+        eprintln!("First camera frame: {} bytes -> /tmp/test_frame.jpg", data.len());
+    }
+
+    unsafe {
+        ptr::copy_nonoverlapping(data.as_ptr(), buf, len);
+    }
+
+    len as u32
+}
+
+fn cleanup_old_gadgets() {
+    let gadget_dir = std::path::Path::new("/sys/kernel/config/usb_gadget");
+    let Ok(entries) = std::fs::read_dir(gadget_dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let udc_path = path.join("UDC");
+        if udc_path.exists() {
+            eprintln!("Cleaning up old gadget: {}", path.display());
+            let _ = std::fs::write(&udc_path, "\n");
+            thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let _ = usb_gadget::remove_all();
+    }
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    if args.focus {
+        return focus_client();
+    }
+
+    // Register signal handlers for focus control
+    unsafe {
+        libc::signal(libc::SIGUSR1, handle_focus_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGUSR2, handle_focus_signal as *const () as libc::sighandler_t);
+    }
+
+    let _ = std::fs::write(PID_FILE, format!("{}", std::process::id()));
+
+    static QUIT: AtomicBool = AtomicBool::new(false);
+    ctrlc::set_handler(move || {
+        QUIT.store(true, Ordering::SeqCst);
+    })?;
+
+    // Probe camera preview resolution before setting up gadget
+    {
+        let ctx = CameraContext::new()?;
+        let camera = ctx.autodetect_camera().wait()
+            .with_context(|| "Failed to discover camera for probing")?;
+        eprintln!("Probing camera: {}", camera.abilities().model());
+        let frame = camera.capture_preview().wait()?;
+        let data = frame.get_data(&ctx).wait()?;
+        let reader = image::ImageReader::new(std::io::Cursor::new(&data))
+            .with_guessed_format()?;
+        let (w, h) = reader.into_dimensions()?;
+        PREVIEW_WIDTH.store(w, Ordering::Relaxed);
+        PREVIEW_HEIGHT.store(h, Ordering::Relaxed);
+        eprintln!("Preview resolution: {}x{}", w, h);
+    }
+
+    let width = PREVIEW_WIDTH.load(Ordering::Relaxed);
+    let height = PREVIEW_HEIGHT.load(Ordering::Relaxed);
+
+    loop {
+        if QUIT.load(Ordering::SeqCst) {
+            break;
+        }
+
+        cleanup_old_gadgets();
+
+        eprintln!("Setting up UVC gadget...");
+
+        let mut builder = usb_gadget::function::video::UvcBuilder::default();
+        // Work around usb-gadget crate bug: Frame::new() computes intervals as
+        // 1_000_000_000/fps (nanoseconds) instead of 10_000_000/fps (100ns units).
+        let frame = usb_gadget::function::video::UvcFrame::new(
+            width, height, Format::Mjpeg,
+            [10_000_000 / FPS as u32],  // 333333 for 30fps
+        );
+        builder.frames = vec![frame];
+        builder.processing_controls = Some(0);
+        builder.camera_controls = Some(0);
+        let (_uvc, uvc_func) = builder.build();
+
+        let udc = default_udc().context("No UDC found. Is dwc2 overlay enabled?")?;
+        let gadget = Gadget::new(
+            Class::MISCELLANEOUS_IAD,
+            Id::new(0x1d6b, 0x0104),
+            Strings::new("EOS Stream", "Canon EOS Webcam", "0000001"),
+        )
+        .with_config(Config::new("UVC Config").with_function(uvc_func))
+        .bind(&udc)
+        .context("Failed to bind gadget to UDC")?;
+
+        eprintln!("Gadget bound to {}", udc.name().to_string_lossy());
+
+        let soft_connect = format!("/sys/class/udc/{}/soft_connect", udc.name().to_string_lossy());
+        if let Err(e) = std::fs::write(&soft_connect, "connect") {
+            eprintln!("soft_connect: {} (may already be connected)", e);
+        } else {
+            eprintln!("Forced USB soft connect");
+        }
+        thread::sleep(std::time::Duration::from_secs(1));
+
+        unsafe {
+            let fc = bindings::configfs_parse_uvc_function(ptr::null());
+            if fc.is_null() {
+                eprintln!("Failed to parse UVC function config, retrying...");
+                drop(gadget);
+                let _ = usb_gadget::remove_all();
+                thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+
+            let src = bindings::rust_video_source_create();
+            if src.is_null() {
+                bindings::configfs_free_uvc_function(fc);
+                drop(gadget);
+                let _ = usb_gadget::remove_all();
+                eprintln!("Failed to create video source, retrying...");
+                thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+
+            let mut events: bindings::events = std::mem::zeroed();
+            bindings::events_init(&mut events);
+
+            let stream = bindings::uvc_stream_new((*fc).video);
+            if stream.is_null() {
+                bindings::video_source_destroy(src);
+                bindings::configfs_free_uvc_function(fc);
+                drop(gadget);
+                let _ = usb_gadget::remove_all();
+                eprintln!("Failed to create UVC stream, retrying...");
+                thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+
+            bindings::uvc_stream_set_event_handler(stream, &mut events);
+            bindings::uvc_stream_set_video_source(stream, src);
+            bindings::uvc_stream_init_uvc(stream, fc);
+
+            eprintln!("UVC stream ready, waiting for host ({}x{} @ {}fps)...", width, height, FPS);
+
+            let events_send = &mut events as *mut bindings::events as usize;
+            thread::spawn(move || {
+                while !QUIT.load(Ordering::SeqCst) {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                }
+                eprintln!("\nStopping...");
+                bindings::events_stop(events_send as *mut bindings::events);
+            });
+
+            bindings::events_loop(&mut events);
+
+            eprintln!("Event loop exited, cleaning up...");
+            bindings::uvc_stream_delete(stream);
+            bindings::video_source_destroy(src);
+            bindings::events_cleanup(&mut events);
+            bindings::configfs_free_uvc_function(fc);
+        }
+
+        // Ensure camera is released between sessions
+        rust_camera_stop();
+
+        drop(gadget);
+        let _ = usb_gadget::remove_all();
+
+        if QUIT.load(Ordering::SeqCst) {
+            break;
+        }
+
+        eprintln!("USB disconnected, restarting in 2s...");
+        thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    let _ = std::fs::remove_file(PID_FILE);
+    eprintln!("Done.");
+    Ok(())
 }

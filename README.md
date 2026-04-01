@@ -1,13 +1,25 @@
 # eos-stream
 
-Streams preview video feed from Canon EOS cameras using gPhoto2
+Turns a Raspberry Pi 4 into a USB webcam that streams from a Canon EOS camera.
 
-```bash
-$ eos-stream | ffmpeg -i - -vcodec rawvideo -pix_fmt yuv420p -threads 0 -f v4l2 /dev/video0
-```
+Connect: **Canon EOS** → USB → **Pi 4** → USB-C → **Mac** (sees a webcam)
+
+## Setup
+
+1. `/boot/firmware/config.txt`:
+  ```diff
+   [all]
+  +dtoverlay=dwc2
+  ```
+2. in `/etc/modules`:
+  ```diff
+  +dwc2
+  +libcomposite
+  ```
+3. `systemctl enable --now eos-stream`
+4. disable all unneccessary systemd services
+5. Enable `overlayfs` in `raspi-config`
 
 ### Focus adjustment
 
-Press the <kbd>+</kbd> / <kbd>-</kbd> keys in the terminal window to manually
-drive focus around.
-
+Press <kbd>+</kbd> / <kbd>-</kbd> in the terminal to drive focus.
