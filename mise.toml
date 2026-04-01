@@ -1,0 +1,19 @@
+[tasks.deb]
+description = "Build .deb package in makedeb container"
+run = """
+docker run --rm -v $(pwd):/src:ro -v $(pwd):/out \
+  ghcr.io/makedeb/makedeb:debian-bullseye bash -c '
+  set -e
+  sudo apt-get update -qq 2>&1 | tail -1
+  sudo apt-get install -y -qq curl libgphoto2-dev libclang-dev pkg-config libudev-dev gcc rsync 2>&1 | tail -3
+  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal 2>&1 | tail -1
+  export PATH=$HOME/.cargo/bin:$PATH
+  mkdir -p ~/work
+  rsync -a --exclude=.jj --exclude=target /src/ ~/work/
+  cd ~/work
+  makedeb -s --no-confirm 2>&1
+  sudo cp ~/work/*.deb /out/
+  echo "=== Built ==="
+  ls -lh /out/*.deb
+'
+"""

@@ -1,0 +1,15 @@
+[Unit]
+Description=Canon EOS USB Webcam Stream
+After=sys-kernel-config.mount systemd-modules-load.service
+Requires=sys-kernel-config.mount
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/eos-stream
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
