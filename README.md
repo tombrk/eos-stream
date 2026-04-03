@@ -20,6 +20,12 @@ Connect: **Canon EOS** → USB → **Pi 4** → USB-C → **Mac** (sees a webcam
 4. disable all unneccessary systemd services
 5. Enable `overlayfs` in `raspi-config`
 
+_Note_: To make changes later, use:
+```
+$ sudo mount -o remount,rw /media/root-ro
+$ sudo chroot /media/root-ro dpkg -i /path/to/eos-stream.deb
+```
+
 ### Focus adjustment
 
 Press <kbd>+</kbd> / <kbd>-</kbd> in the terminal to drive focus.

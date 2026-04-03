@@ -1,6 +1,6 @@
 # Maintainer: Tom <deb@tombrk.de>
 pkgname=eos-stream
-pkgver=0.2.1
+pkgver=0.2.6
 pkgrel=1
 pkgdesc="Canon EOS USB webcam streamer for Raspberry Pi 4"
 arch=('arm64')

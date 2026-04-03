@@ -38,6 +38,8 @@ struct CameraState {
 }
 
 static CAMERA: Mutex<Option<CameraState>> = Mutex::new(None);
+static PLACEHOLDER_JPEG: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static STREAMING: AtomicBool = AtomicBool::new(false);
 
 static FOCUS_NEAR: AtomicI32 = AtomicI32::new(0);
 static FOCUS_FAR: AtomicI32 = AtomicI32::new(0);
@@ -86,41 +88,46 @@ fn focus_client() -> Result<()> {
 /// Called from C when the host starts streaming.
 #[no_mangle]
 pub extern "C" fn rust_camera_start() -> i32 {
-    let ctx = match CameraContext::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("gphoto2 context failed: {}", e);
-            return -1;
-        }
+    let guard = CAMERA.lock().unwrap();
+    if guard.is_none() {
+        eprintln!("rust_camera_start: no camera connected");
+        return -1;
     };
-    let camera = match ctx.autodetect_camera().wait() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Camera not found: {}", e);
-            return -1;
-        }
-    };
-    eprintln!("Camera connected: {}", camera.abilities().model());
     FRAME_NUM.store(0, Ordering::Relaxed);
-    *CAMERA.lock().unwrap() = Some(CameraState { ctx, camera });
+    STREAMING.store(true, Ordering::Relaxed);
     0
 }
 
-/// Called from C when the host stops streaming.
+/// Lower the mirror when the host stops streaming.
 #[no_mangle]
 pub extern "C" fn rust_camera_stop() {
-    let prev = CAMERA.lock().unwrap().take();
-    if prev.is_some() {
-        eprintln!("Camera disconnected");
+    let guard = CAMERA.lock().unwrap();
+    STREAMING.store(false, Ordering::Relaxed);
+    let Some(state) = guard.as_ref() else { return };
+    match state.camera.config_key::<gphoto2::widget::ToggleWidget>("viewfinder").wait() {
+        Ok(vf) => {
+            let _ = vf.set_toggled(false);
+            if let Err(e) = state.camera.set_config(&vf).wait() {
+                eprintln!("Failed to lower mirror: {}", e);
+            }
+        }
+        Err(e) => eprintln!("viewfinder config not found: {}", e),
     }
 }
 
 /// Called from C (rust-source.c) to fill a buffer with MJPEG data.
 #[no_mangle]
 pub extern "C" fn rust_fill_jpeg(buf: *mut u8, max_size: u32) -> u32 {
+    if !STREAMING.load(Ordering::Relaxed) {
+        return fill_placeholder(buf, max_size);
+    }
+
     let n = FRAME_NUM.fetch_add(1, Ordering::Relaxed);
     let guard = CAMERA.lock().unwrap();
-    let Some(state) = guard.as_ref() else { return 0 };
+    let Some(state) = guard.as_ref() else {
+        eprintln!("rust_fill_jpeg: no camera connected");
+        return 0;
+    };
 
     let near = FOCUS_NEAR.swap(0, Ordering::Relaxed);
     let far = FOCUS_FAR.swap(0, Ordering::Relaxed);
@@ -137,14 +144,14 @@ pub extern "C" fn rust_fill_jpeg(buf: *mut u8, max_size: u32) -> u32 {
         Ok(f) => f,
         Err(e) => {
             eprintln!("capture_preview failed: {}", e);
-            return 0;
+            return fill_placeholder(buf, max_size);
         }
     };
     let data = match frame.get_data(&state.ctx).wait() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("get_data failed: {}", e);
-            return 0;
+            return fill_placeholder(buf, max_size);
         }
     };
     drop(guard);
@@ -160,6 +167,19 @@ pub extern "C" fn rust_fill_jpeg(buf: *mut u8, max_size: u32) -> u32 {
         ptr::copy_nonoverlapping(data.as_ptr(), buf, len);
     }
 
+    len as u32
+}
+
+
+fn fill_placeholder(buf: *mut u8, max_size: u32) -> u32 {
+    let jpeg = PLACEHOLDER_JPEG.lock().unwrap();
+    let len = jpeg.len().min(max_size as usize);
+    if len == 0 {
+        return 0;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(jpeg.as_ptr(), buf, len);
+    }
     len as u32
 }
 
@@ -198,12 +218,12 @@ fn main() -> Result<()> {
         QUIT.store(true, Ordering::SeqCst);
     })?;
 
-    // Probe camera preview resolution before setting up gadget
+    // Connect camera and probe preview resolution (kept alive for the lifetime of the process)
     {
         let ctx = CameraContext::new()?;
         let camera = ctx.autodetect_camera().wait()
             .with_context(|| "Failed to discover camera for probing")?;
-        eprintln!("Probing camera: {}", camera.abilities().model());
+        eprintln!("Camera connected: {}", camera.abilities().model());
         let frame = camera.capture_preview().wait()?;
         let data = frame.get_data(&ctx).wait()?;
         let reader = image::ImageReader::new(std::io::Cursor::new(&data))
@@ -212,6 +232,22 @@ fn main() -> Result<()> {
         PREVIEW_WIDTH.store(w, Ordering::Relaxed);
         PREVIEW_HEIGHT.store(h, Ordering::Relaxed);
         eprintln!("Preview resolution: {}x{}", w, h);
+        // Generate red placeholder JPEG for prefill before camera is in live view
+        {
+            let mut img = image::RgbImage::new(w, h);
+            for p in img.pixels_mut() {
+                *p = image::Rgb([180, 0, 0]);
+            }
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Jpeg).expect("failed to encode placeholder");
+            *PLACEHOLDER_JPEG.lock().unwrap() = buf.into_inner();
+        }
+        // Lower mirror after probing
+        if let Ok(vf) = camera.config_key::<gphoto2::widget::ToggleWidget>("viewfinder").wait() {
+            let _ = vf.set_toggled(false);
+            let _ = camera.set_config(&vf).wait();
+        }
+        *CAMERA.lock().unwrap() = Some(CameraState { ctx, camera });
     }
 
     let width = PREVIEW_WIDTH.load(Ordering::Relaxed);
@@ -315,9 +351,6 @@ fn main() -> Result<()> {
             bindings::events_cleanup(&mut events);
             bindings::configfs_free_uvc_function(fc);
         }
-
-        // Ensure camera is released between sessions
-        rust_camera_stop();
 
         drop(gadget);
         let _ = usb_gadget::remove_all();
