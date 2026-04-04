@@ -1,6 +1,6 @@
 [package]
-name = "eos-stream"
-version = "0.2.0"
+name = "eos-uvc"
+version = "0.2.8"
 edition = "2021"
 
 [build-dependencies]

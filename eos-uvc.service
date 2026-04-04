@@ -5,7 +5,7 @@ Requires=sys-kernel-config.mount
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/eos-stream
+ExecStart=/usr/bin/eos-uvc
 Restart=always
 RestartSec=2
 StandardOutput=journal

@@ -24,7 +24,7 @@ struct Args {
     focus: bool,
 }
 
-const PID_FILE: &str = "/run/eos-stream.pid";
+const PID_FILE: &str = "/run/eos-uvc.pid";
 
 static PREVIEW_WIDTH: AtomicU32 = AtomicU32::new(1280);
 static PREVIEW_HEIGHT: AtomicU32 = AtomicU32::new(720);
@@ -230,10 +230,10 @@ fn main() -> Result<()> {
         .map(|w| w.value())
         .unwrap_or_else(|_| camera_model_name.clone());
     let gadget_manufacturer = camera.config_key::<gphoto2::widget::TextWidget>("manufacturer").wait()
-        .map(|w| format!("{} (via eos-stream)", w.value()))
+        .map(|w| format!("{} (via eos-uvc)", w.value()))
         .unwrap_or_else(|_| {
             let mfr = camera_model_name.split_whitespace().next().unwrap_or("Unknown");
-            format!("{} (via eos-stream)", mfr)
+            format!("{} (via eos-uvc)", mfr)
         });
     let gadget_serial = camera.config_key::<gphoto2::widget::TextWidget>("eosserialnumber").wait()
         .or_else(|_| camera.config_key::<gphoto2::widget::TextWidget>("serialnumber").wait())

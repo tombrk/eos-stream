@@ -1,4 +1,4 @@
-# eos-stream
+# eos-uvc
 
 Turns a Raspberry Pi 4 into a USB webcam that streams from a Canon EOS camera.
 
@@ -16,14 +16,14 @@ Connect: **Canon EOS** → USB → **Pi 4** → USB-C → **Mac** (sees a webcam
   +dwc2
   +libcomposite
   ```
-3. `systemctl enable --now eos-stream`
+3. `systemctl enable --now eos-uvc`
 4. disable all unneccessary systemd services
 5. Enable `overlayfs` in `raspi-config`
 
 _Note_: To make changes later, use:
 ```
 $ sudo mount -o remount,rw /media/root-ro
-$ sudo chroot /media/root-ro dpkg -i /path/to/eos-stream.deb
+$ sudo chroot /media/root-ro dpkg -i /path/to/eos-uvc.deb
 ```
 
 ### Focus adjustment
