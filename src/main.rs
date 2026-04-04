@@ -219,36 +219,53 @@ fn main() -> Result<()> {
     })?;
 
     // Connect camera and probe preview resolution (kept alive for the lifetime of the process)
+    let ctx = CameraContext::new()?;
+    let camera = ctx.autodetect_camera().wait()
+        .with_context(|| "Failed to discover camera for probing")?;
+    let camera_model_name = camera.abilities().model().to_string();
+    eprintln!("Camera connected: {}", camera_model_name);
+
+    // Query camera metadata for USB gadget identity
+    let gadget_product = camera.config_key::<gphoto2::widget::TextWidget>("cameramodel").wait()
+        .map(|w| w.value())
+        .unwrap_or_else(|_| camera_model_name.clone());
+    let gadget_manufacturer = camera.config_key::<gphoto2::widget::TextWidget>("manufacturer").wait()
+        .map(|w| format!("{} (via eos-stream)", w.value()))
+        .unwrap_or_else(|_| {
+            let mfr = camera_model_name.split_whitespace().next().unwrap_or("Unknown");
+            format!("{} (via eos-stream)", mfr)
+        });
+    let gadget_serial = camera.config_key::<gphoto2::widget::TextWidget>("eosserialnumber").wait()
+        .or_else(|_| camera.config_key::<gphoto2::widget::TextWidget>("serialnumber").wait())
+        .map(|w| w.value())
+        .unwrap_or_else(|_| "0000000".to_string());
+    eprintln!("USB gadget identity: manufacturer=\"{}\" product=\"{}\" serial=\"{}\"",
+        gadget_manufacturer, gadget_product, gadget_serial);
+
+    let frame = camera.capture_preview().wait()?;
+    let data = frame.get_data(&ctx).wait()?;
+    let reader = image::ImageReader::new(std::io::Cursor::new(&data))
+        .with_guessed_format()?;
+    let (w, h) = reader.into_dimensions()?;
+    PREVIEW_WIDTH.store(w, Ordering::Relaxed);
+    PREVIEW_HEIGHT.store(h, Ordering::Relaxed);
+    eprintln!("Preview resolution: {}x{}", w, h);
+    // Generate red placeholder JPEG for prefill before camera is in live view
     {
-        let ctx = CameraContext::new()?;
-        let camera = ctx.autodetect_camera().wait()
-            .with_context(|| "Failed to discover camera for probing")?;
-        eprintln!("Camera connected: {}", camera.abilities().model());
-        let frame = camera.capture_preview().wait()?;
-        let data = frame.get_data(&ctx).wait()?;
-        let reader = image::ImageReader::new(std::io::Cursor::new(&data))
-            .with_guessed_format()?;
-        let (w, h) = reader.into_dimensions()?;
-        PREVIEW_WIDTH.store(w, Ordering::Relaxed);
-        PREVIEW_HEIGHT.store(h, Ordering::Relaxed);
-        eprintln!("Preview resolution: {}x{}", w, h);
-        // Generate red placeholder JPEG for prefill before camera is in live view
-        {
-            let mut img = image::RgbImage::new(w, h);
-            for p in img.pixels_mut() {
-                *p = image::Rgb([180, 0, 0]);
-            }
-            let mut buf = std::io::Cursor::new(Vec::new());
-            img.write_to(&mut buf, image::ImageFormat::Jpeg).expect("failed to encode placeholder");
-            *PLACEHOLDER_JPEG.lock().unwrap() = buf.into_inner();
+        let mut img = image::RgbImage::new(w, h);
+        for p in img.pixels_mut() {
+            *p = image::Rgb([180, 0, 0]);
         }
-        // Lower mirror after probing
-        if let Ok(vf) = camera.config_key::<gphoto2::widget::ToggleWidget>("viewfinder").wait() {
-            let _ = vf.set_toggled(false);
-            let _ = camera.set_config(&vf).wait();
-        }
-        *CAMERA.lock().unwrap() = Some(CameraState { ctx, camera });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Jpeg).expect("failed to encode placeholder");
+        *PLACEHOLDER_JPEG.lock().unwrap() = buf.into_inner();
     }
+    // Lower mirror after probing
+    if let Ok(vf) = camera.config_key::<gphoto2::widget::ToggleWidget>("viewfinder").wait() {
+        let _ = vf.set_toggled(false);
+        let _ = camera.set_config(&vf).wait();
+    }
+    *CAMERA.lock().unwrap() = Some(CameraState { ctx, camera });
 
     let width = PREVIEW_WIDTH.load(Ordering::Relaxed);
     let height = PREVIEW_HEIGHT.load(Ordering::Relaxed);
@@ -278,7 +295,7 @@ fn main() -> Result<()> {
         let gadget = Gadget::new(
             Class::MISCELLANEOUS_IAD,
             Id::new(0x1d6b, 0x0104),
-            Strings::new("EOS Stream", "Canon EOS Webcam", "0000001"),
+            Strings::new(&gadget_manufacturer, &gadget_product, &gadget_serial),
         )
         .with_config(Config::new("UVC Config").with_function(uvc_func))
         .bind(&udc)
